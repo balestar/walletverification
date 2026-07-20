@@ -31,3 +31,4 @@ cloudflare-env.d.ts
 
 # supabase CLI local cache/link metadata
 supabase/.temp/
+.vercel

